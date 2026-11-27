@@ -1,4 +1,6 @@
 using Auction.Api.Data;
+using BidValidator.Grpc;
+using Grpc.Net.Client;
 using Microsoft.EntityFrameworkCore;
 using Shared.Models;
 
@@ -55,22 +57,29 @@ app.MapGet("/auctions/{id:guid}", async (Guid id, AuctionDbContext db) =>
     return auction is not null ? Results.Ok(auction) : Results.NotFound("Không tìm thấy phiên đấu giá.");
 });
 
-// 4. Gửi mức giá mới (Đặt giá)
+// 4. Gửi mức giá mới (Đặt giá - gọi sang BidValidator.Grpc kiểm tra)
 app.MapPost("/auctions/{id:guid}/bids", async (Guid id, PlaceBidRequest req, AuctionDbContext db, ILogger<Program> logger) =>
 {
     var auction = await db.Auctions.FindAsync(id);
     if (auction is null)
         return Results.NotFound("Không tìm thấy phiên đấu giá.");
 
-    if (auction.Status != AuctionStatus.Open || DateTime.UtcNow > auction.EndTime)
-        return Results.BadRequest("Phiên đấu giá đã kết thúc.");
+    // Gọi sang BidValidator.Grpc (cổng 5088) để kiểm tra lượt trả giá
+    using var channel = GrpcChannel.ForAddress("http://localhost:5088");
+    var grpcClient = new BidValidator.Grpc.BidValidator.BidValidatorClient(channel);
 
-    if (string.IsNullOrWhiteSpace(req.BidderName))
-        return Results.BadRequest("Tên người đặt giá không được để trống.");
+    var validationReply = await grpcClient.ValidateBidAsync(new ValidateBidRequest
+    {
+        BidderName = req.BidderName ?? "",
+        BidAmount = (double)req.Amount,
+        CurrentPrice = (double)auction.CurrentPrice,
+        MinStep = (double)auction.MinStep,
+        EndTimeUnix = new DateTimeOffset(auction.EndTime).ToUnixTimeSeconds(),
+        Status = (int)auction.Status
+    });
 
-    var minValidPrice = auction.CurrentPrice + auction.MinStep;
-    if (req.Amount < minValidPrice)
-        return Results.BadRequest($"Mức giá không hợp lệ. Giá đặt tối thiểu phải là {minValidPrice:N0}.");
+    if (!validationReply.IsValid)
+        return Results.BadRequest(validationReply.Message);
 
     auction.CurrentPrice = req.Amount;
     auction.HighestBidder = req.BidderName;
