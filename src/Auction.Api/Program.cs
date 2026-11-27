@@ -1,7 +1,11 @@
+using System.Text;
+using System.Text.Json;
 using Auction.Api.Data;
 using BidValidator.Grpc;
 using Grpc.Net.Client;
 using Microsoft.EntityFrameworkCore;
+using RabbitMQ.Client;
+using Shared.Events;
 using Shared.Models;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -57,7 +61,7 @@ app.MapGet("/auctions/{id:guid}", async (Guid id, AuctionDbContext db) =>
     return auction is not null ? Results.Ok(auction) : Results.NotFound("Không tìm thấy phiên đấu giá.");
 });
 
-// 4. Gửi mức giá mới (Đặt giá - gọi sang BidValidator.Grpc kiểm tra)
+// 4. Gửi mức giá mới (gọi BidValidator.Grpc kiểm tra -> lưu DB -> phát BidAccepted qua RabbitMQ)
 app.MapPost("/auctions/{id:guid}/bids", async (Guid id, PlaceBidRequest req, AuctionDbContext db, ILogger<Program> logger) =>
 {
     var auction = await db.Auctions.FindAsync(id);
@@ -65,8 +69,8 @@ app.MapPost("/auctions/{id:guid}/bids", async (Guid id, PlaceBidRequest req, Auc
         return Results.NotFound("Không tìm thấy phiên đấu giá.");
 
     // Gọi sang BidValidator.Grpc (cổng 5088) để kiểm tra lượt trả giá
-    using var channel = GrpcChannel.ForAddress("http://localhost:5088");
-    var grpcClient = new BidValidator.Grpc.BidValidator.BidValidatorClient(channel);
+    using var grpcChannel = GrpcChannel.ForAddress("http://localhost:5088");
+    var grpcClient = new BidValidator.Grpc.BidValidator.BidValidatorClient(grpcChannel);
 
     var validationReply = await grpcClient.ValidateBidAsync(new ValidateBidRequest
     {
@@ -85,7 +89,26 @@ app.MapPost("/auctions/{id:guid}/bids", async (Guid id, PlaceBidRequest req, Auc
     auction.HighestBidder = req.BidderName;
     await db.SaveChangesAsync();
 
-    logger.LogInformation("{Bidder} đã đặt giá {Amount} cho phiên {AuctionId}", req.BidderName, req.Amount, id);
+    // Phát sự kiện BidAccepted qua RabbitMQ
+    var factory = new ConnectionFactory { HostName = "localhost" };
+    await using var rmqConnection = await factory.CreateConnectionAsync();
+    await using var rmqChannel = await rmqConnection.CreateChannelAsync();
+
+    await rmqChannel.ExchangeDeclareAsync(exchange: "auction.events", type: ExchangeType.Fanout, durable: true);
+
+    var bidEvent = new BidAcceptedEvent
+    {
+        AuctionId = auction.Id,
+        ProductName = auction.ProductName,
+        BidderName = req.BidderName!,
+        Amount = req.Amount,
+        Timestamp = DateTime.UtcNow
+    };
+
+    var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(bidEvent));
+    await rmqChannel.BasicPublishAsync(exchange: "auction.events", routingKey: string.Empty, body: body);
+
+    logger.LogInformation("{Bidder} đã đặt giá {Amount} cho phiên {AuctionId} và phát sự kiện BidAccepted", req.BidderName, req.Amount, id);
     return Results.Ok(auction);
 });
 
